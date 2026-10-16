@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MCP Protocol Demo</title>
+  <meta name="description" content="A plant-care chatbot whose agent discovers and calls two MCP servers, drawn live.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%233ddc8a' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M12 22v-5M9 8V2M15 8V2M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" id="brand-mark" aria-hidden="true"></span>
+      <div>
+        <h1>MCP Protocol Demo</h1>
+        <p data-i18n="subtitle"></p>
+      </div>
+    </div>
+    <div class="controls">
+      <span class="status" id="status" role="status"><span class="dot"></span><span class="label"></span></span>
+      <button class="btn" id="btn-restart" type="button"><span class="ico" data-icon="refresh"></span><span data-i18n="restart"></span></button>
+      <button class="btn toggle" id="btn-slow" type="button" aria-pressed="false"><span class="ico" data-icon="slow"></span><span data-i18n="slow"></span></button>
+      <div class="langs" role="group" aria-label="Language">
+        <button class="lang" type="button" data-lang="pt">PT</button>
+        <button class="lang" type="button" data-lang="en">EN</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel chat" aria-labelledby="chat-title">
+      <div class="panel-head"><h2 id="chat-title" data-i18n="chat"></h2></div>
+      <div class="messages" id="messages" aria-live="polite"></div>
+      <div class="suggestions" id="suggestions"></div>
+      <form class="composer" id="composer">
+        <label class="sr-only" for="input" data-i18n="placeholder"></label>
+        <textarea id="input" rows="2" maxlength="1000" data-i18n-placeholder="placeholder"></textarea>
+        <button type="submit" class="send" id="send" data-i18n-aria="send"><span class="ico" data-icon="send"></span></button>
+      </form>
+    </section>
+
+    <section class="panel stage" aria-labelledby="flow-title">
+      <div class="panel-head">
+        <h2 id="flow-title" data-i18n="workflow"></h2>
+        <p class="now" id="now" aria-live="polite"></p>
+      </div>
+      <div class="flow-scroll">
+        <div class="flow" id="flow"></div>
+      </div>
+      <div class="steps-head">
+        <h3 data-i18n="steps"></h3>
+        <span class="count" id="step-count">0</span>
+      </div>
+      <ol class="steps" id="steps"></ol>
+    </section>
+  </main>
+
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>
