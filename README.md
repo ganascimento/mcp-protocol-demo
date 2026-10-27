@@ -80,7 +80,7 @@ sequenceDiagram
         W-->>H: 14 mm of rain today
     end
     H->>L: the two results
-    L-->>H: "Water the fern; the rain covers the balcony."
+    L-->>H: "Water the fern — the rain covers the balcony."
 ```
 
 ## 🧠 MCP in five ideas (what the demo makes visible)
