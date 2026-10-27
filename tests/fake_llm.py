@@ -16,6 +16,6 @@ class FakeLLM:
         if isinstance(step, str):
             return {"role": "assistant", "content": step}
         calls = [{"id": f"call_{i}", "type": "function",
-                  "function": {"name": name, "arguments": args if isinstance(args, str) else json.dumps(args)}}
+                  "function": {"name": name, "arguments": json.dumps(args)}}
                  for i, (name, args) in enumerate(step)]
         return {"role": "assistant", "content": None, "tool_calls": calls}

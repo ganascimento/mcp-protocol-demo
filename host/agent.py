@@ -40,92 +40,110 @@ class RegisteredTool:
         }}
 
 
+@dataclass(frozen=True)
+class Answer:
+    text: str
+    seq: int  # the event that delivered it: the UI waits for this one before showing the text itself
+
+
+class BootError(Exception):
+    def __init__(self, server: str, reason: str, message: str):
+        super().__init__(message)
+        self.server, self.reason = server, reason  # reason: "unavailable" | "conflict"
+
+
 class Agent:
     def __init__(self, servers: dict[str, str], llm, bus: EventBus):
         self.servers = servers
         self.llm, self.bus = llm, bus
         self.registry: dict[str, RegisteredTool] = {}
+        self.definitions: list[dict] = []  # what the LLM is sent: built once per boot
         self.ready = False
         self._boot_lock = asyncio.Lock()
+
+    @property
+    def model(self) -> str:
+        return self.llm.model
 
     # --- boot -----------------------------------------------------------------------------------------
 
     async def boot(self) -> None:
         async with self._boot_lock:
             self.ready = False
-            self.bus.emit("boot_start", servers=self.servers, model=getattr(self.llm, "model", "llm"))
+            self.bus.emit("boot_start", servers=self.servers, model=self.model)
             registry: dict[str, RegisteredTool] = {}
-            # One server after the other, so the UI tells a clear story. A production host would discover in parallel.
-            for name, url in self.servers.items():
-                self.bus.emit("connect", server=name, url=url)
-                connection = MCPConnection(name, url, self.bus)
-                try:
-                    tools = await connection.open()
-                except ServerUnavailable as e:
-                    self.bus.emit("boot_error", server=name, error=str(e))
-                    await _close(registry)
-                    raise
-                self.bus.emit("server_ready", server=name, version=connection.protocol_version,
-                              title=connection.server_info.title if connection.server_info else None,
-                              instructions=connection.instructions,
-                              tools=[_summary(t) for t in tools])
-                for tool in tools:
-                    if tool.name in registry:
-                        # Two servers, one name: whichever registered last would win in silence (tool shadowing).
-                        error = f"Tool '{tool.name}' is published by both '{registry[tool.name].server.name}' and '{name}'"
-                        self.bus.emit("boot_error", server=name, error=error)
-                        await _close(registry)
-                        await connection.close()
-                        raise ValueError(error)
-                    registry[tool.name] = RegisteredTool(connection, tool)
-                self.bus.emit("tools_registered", server=name,
-                              tools=[registry[t.name].definition["function"] for t in tools])
-            old, self.registry = self.registry, registry
-            await _close(old)
+            opened: list[MCPConnection] = []
+            try:
+                # One server after the other, so the UI tells a clear story. A production host would discover in parallel.
+                for name, url in self.servers.items():
+                    await self._discover(name, url, registry, opened)
+            except BaseException as e:
+                if isinstance(e, BootError):
+                    self.bus.emit("boot_error", server=e.server, reason=e.reason, error=str(e))
+                await _close(opened)  # one cleanup for every way a boot can fail
+                raise
+            old = {r.server for r in self.registry.values()}
+            self.registry, self.definitions = registry, [r.definition for r in registry.values()]
             self.ready = True
             self.bus.emit("ready", tools=[{"name": n, "server": r.server.name} for n, r in registry.items()])
+            await _close(old)
+
+    async def _discover(self, name: str, url: str, registry: dict, opened: list) -> None:
+        self.bus.emit("connect", server=name, url=url)
+        connection = MCPConnection(name, url, self.bus)
+        try:
+            tools = await connection.open()
+        except ServerUnavailable as e:
+            raise BootError(name, "unavailable", str(e)) from e
+        opened.append(connection)
+        self.bus.emit("server_ready", server=name, version=connection.protocol_version,
+                      instructions=connection.instructions, tools=[_summary(t) for t in tools])
+        added = [RegisteredTool(connection, t) for t in tools]
+        for r in added:
+            if r.tool.name in registry:
+                # Two servers, one name: whichever registered last would win in silence (tool shadowing).
+                owner = registry[r.tool.name].server.name
+                raise BootError(name, "conflict", f"Tool '{r.tool.name}' is published by both '{owner}' and '{name}'")
+            registry[r.tool.name] = r
+        self.bus.emit("tools_registered", server=name, tools=[r.definition for r in added])
 
     async def close(self) -> None:
         self.ready = False
-        await _close(self.registry)
+        await _close({r.server for r in self.registry.values()})
 
     # --- one chat turn --------------------------------------------------------------------------------
 
-    async def reply(self, history: list[dict], text: str) -> str:
+    async def reply(self, history: list[dict], text: str) -> Answer:
         """history = earlier turns, user/assistant text only. Tool results are NOT kept between turns: the next
-        turn asks the servers again (fresh data, shorter prompts; the price is repeating a call now and then)."""
+        turn asks the servers again (fresh data, shorter prompts; the price is repeating a call now and then).
+        Every exit emits one "answer" event: the UI ends a turn in one place."""
         self.bus.emit("user", text=text)
-        definitions = [r.definition for r in self.registry.values()]
+        names = [d["function"]["name"] for d in self.definitions]
         messages = [{"role": "system", "content": SYSTEM_PROMPT.format(today=date.today().isoformat())},
                     *history, {"role": "user", "content": text}]
         try:
             for round_ in range(1, MAX_ROUNDS + 1):
-                self.bus.emit("llm_request", round=round_, messages=len(messages),
-                              tools=[d["function"]["name"] for d in definitions])
-                message = await self.llm(messages, definitions)
+                self.bus.emit("llm_request", round=round_, messages=len(messages), tools=names)
+                message = await self.llm(messages, self.definitions)
                 calls = message.get("tool_calls") or []
-                self.bus.emit("llm_decision", round=round_, text=message.get("content") if not calls else None,
-                              tool_calls=[self._describe(c) for c in calls])
+                self.bus.emit("llm_decision", round=round_, text=None if calls else message.get("content"),
+                              tool_calls=calls, owners={c["function"]["name"]: self._owner(c) for c in calls})
                 messages.append(message)
                 if not calls:
-                    answer = message.get("content") or ""
-                    self.bus.emit("answer", text=answer)
-                    return answer
+                    return self._answer(message.get("content") or "")
                 # Several calls in one decision run in parallel — often on different servers.
                 messages += await asyncio.gather(*(self._run(call) for call in calls))
         except ServerUnavailable as e:
             # A server is down: our code tells the user. Handing it to the LLM as text would get an invented excuse.
-            self.bus.emit("error", text=str(e))
-            return f"Sorry — {e}. Please try again in a moment."
-        answer = "Sorry, I couldn't finish that. Could you rephrase?"
-        self.bus.emit("answer", text=answer)
-        return answer
+            return self._answer(f"Sorry — {e}. Please try again in a moment.", error=True)
+        return self._answer("Sorry, I couldn't finish that. Could you rephrase?")
 
-    def _describe(self, call: dict) -> dict:
-        name = call["function"]["name"]
-        owner = self.registry.get(name)
-        return {"id": call["id"], "name": name, "arguments": call["function"].get("arguments") or "{}",
-                "server": owner.server.name if owner else None}
+    def _answer(self, text: str, error: bool = False) -> Answer:
+        return Answer(text, self.bus.emit("answer", text=text, error=error)["seq"])
+
+    def _owner(self, call: dict) -> str | None:
+        owner = self.registry.get(call["function"]["name"])
+        return owner.server.name if owner else None
 
     async def _run(self, call: dict) -> dict:
         name, call_id = call["function"]["name"], call["id"]
@@ -158,6 +176,5 @@ def _summary(tool: types.Tool) -> dict:
             "read_only": bool(hints and hints.read_only_hint)}
 
 
-async def _close(registry: dict[str, RegisteredTool]) -> None:
-    for connection in {id(r.server): r.server for r in registry.values()}.values():
-        await connection.close()
+async def _close(connections) -> None:
+    await asyncio.gather(*(c.close() for c in connections))

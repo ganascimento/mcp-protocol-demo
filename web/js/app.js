@@ -5,34 +5,35 @@ import * as flow from './flow.js';
 import { apply, getLang, list, setLang, t } from './i18n.js';
 import { ICON } from './icons.js';
 import * as steps from './steps.js';
+import { code, esc } from './util.js';
 
 const $ = (id) => document.getElementById(id);
-const esc = steps.esc;
-const code = (s) => `<code>${esc(s)}</code>`;
 
 let slow = false;
 const speed = () => (slow ? 2.2 : 1);
 const queue = [];
 let playing = false;
-let idleWaiters = [];
+let source = null;
+let played = 0;  // seq of the last event handled
+let seqWaiters = [];
 let conversation = null;
 let toolCount = 0;
-let answered = true;
-const outbound = {};  // server → promise of the request packet still travelling (its answer waits for it)
+let lastStatus = ['off', {}], lastNarration = ['nIdle', {}];
+const inFlight = {};  // "server:jsonrpc-id" → the request packet still travelling (its response waits for it)
 
 // --- status + narration -----------------------------------------------------------------------------
 
+const STATUS_KEYS = { boot: 'stBoot', ready: 'stReady', down: 'stDown', busy: 'stBusy', off: 'stOff' };
+
 function status(kind, params = {}) {
-  const el = $('status');
-  el.dataset.kind = kind;
-  el.querySelector('.label').textContent = t({ boot: 'stBoot', ready: 'stReady', down: 'stDown', busy: 'stBusy', off: 'stOff' }[kind], params);
-  el.dataset.params = JSON.stringify(params);
+  lastStatus = [kind, params];
+  $('status').dataset.kind = kind;
+  $('status').querySelector('.label').textContent = t(STATUS_KEYS[kind], params);
 }
 
 function narrate(key, params = {}) {
-  const el = $('now');
-  el.dataset.key = key; el.dataset.params = JSON.stringify(params);
-  el.textContent = t(key, params);
+  lastNarration = [key, params];
+  $('now').textContent = t(key, params);
 }
 
 // --- queue ------------------------------------------------------------------------------------------
@@ -46,50 +47,50 @@ async function play() {
   playing = true;
   while (queue.length) {
     const event = queue.shift();
-    try { await (HANDLERS[event.kind] || (() => {}))(event); } catch (e) { console.error(e); }
+    try { await HANDLERS[event.kind]?.(event); } catch (e) { console.error(e); }
+    played = event.seq;
+    seqWaiters = seqWaiters.filter(({ seq, resolve }) => (seq <= played ? (resolve(), false) : true));
   }
   playing = false;
-  idleWaiters.forEach((resolve) => resolve());
-  idleWaiters = [];
 }
 
-const whenIdle = () => (playing || queue.length ? new Promise((r) => idleWaiters.push(r)) : Promise.resolve());
+/** Resolves once the event `seq` has been played — or at once if the event stream is down. */
+function playedUpTo(seq) {
+  if (played >= seq || source?.readyState !== EventSource.OPEN) return Promise.resolve();
+  return new Promise((resolve) => seqWaiters.push({ seq, resolve }));
+}
 
 // --- wire (real JSON-RPC over HTTP, observed by the host) -------------------------------------------
 
+const who = (server) => `<span class="who">${esc(server)}</span>`;
+const wireTitle = (arrow, e) => `${arrow} ${code(e.method)}${e.name ? ` ${code(e.name)}` : ''} ${who(e.server)}`;
+const wireKey = (e) => `${e.server}:${e.body?.id}`;
+
 function wireOut(e) {
-  const color = flow.colorOf(e.server);
-  const label = e.name ? `${e.method} · ${e.name}` : e.method;
   if (e.method === 'server/discover') narrate('nDiscover', { server: e.server });
   if (e.method === 'tools/list') narrate('nList', { server: e.server });
   steps.add({
-    phase: 'mcp', badge: 'MCP', color, at: e.t,
-    title: `→ ${code(e.method)}${e.name ? ` ${code(e.name)}` : ''} <span class="who">${esc(e.server)}</span>`,
-    sub: `${e.http} · ${Object.entries(e.headers || {}).map(([k, v]) => `${k}: ${v}`).join(' · ')}`,
-    json: e.body,
+    phase: 'mcp', badge: 'MCP', color: flow.colorOf(e.server), at: e.t, titleHtml: wireTitle('→', e),
+    sub: `${e.http} · ${Object.entries(e.headers).map(([k, v]) => `${k}: ${v}`).join(' · ')}`, json: e.body,
   });
-  const travel = flow.packet(e.server, 'fwd', label, color);
+  const travel = flow.packet(e.server, 'fwd', e.name ? `${e.method} · ${e.name}` : e.method);
   if (e.method === 'tools/call') travel.then(() => flow.serverTool(e.server, e.name, 'running'));
-  outbound[e.server] = travel;
+  inFlight[wireKey(e)] = travel;
   return flow.sleep(180);  // parallel calls overlap on screen, like on the wire
 }
 
 async function wireIn(e) {
-  await outbound[e.server];
-  const color = flow.colorOf(e.server);
+  await inFlight[wireKey(e)];
+  delete inFlight[wireKey(e)];
   const result = e.body?.result || {};
   const failed = Boolean(e.body?.error || result.isError || e.status >= 400);
   let label = t('pktResult');
   if (e.method === 'server/discover') label = t('pktVersion', { v: (result.supportedVersions || [])[0] || '?' });
   if (e.method === 'tools/list') label = t('pktList', { n: (result.tools || []).length });
   if (e.method === 'tools/call' && failed) label = t('pktRefused');
-  steps.add({
-    phase: 'mcp', badge: 'MCP', color, at: e.t,
-    title: `← ${code(e.method)}${e.name ? ` ${code(e.name)}` : ''} <span class="who">${esc(e.server)}</span>`,
-    sub: `HTTP ${e.status} · ${e.ms} ms`,
-    json: e.body,
-  });
-  await flow.packet(e.server, 'back', label, color, { error: failed });
+  steps.add({ phase: 'mcp', badge: 'MCP', color: flow.colorOf(e.server), at: e.t, titleHtml: wireTitle('←', e),
+    sub: `HTTP ${e.status} · ${e.ms} ms`, json: e.body });
+  await flow.packet(e.server, 'back', label, { error: failed });
   if (e.method === 'tools/call') flow.serverTool(e.server, e.name, failed ? 'err' : 'ok');
 }
 
@@ -102,7 +103,7 @@ const HANDLERS = {
     steps.section(t('secBoot'));
     flow.reset();
     narrate('nBoot');
-    steps.add({ phase: 'boot', badge: 'BOOT', at: e.t, title: esc(t('bootStart', { n: Object.keys(e.servers).length })),
+    steps.add({ phase: 'boot', badge: 'BOOT', at: e.t, title: t('bootStart', { n: Object.keys(e.servers).length }),
       json: e.servers });
     await flow.sleep(800);
   },
@@ -111,7 +112,7 @@ const HANDLERS = {
     narrate('nConnect', { server: e.server });
     flow.edge(e.server, 'connecting');
     steps.add({ phase: 'boot', badge: 'BOOT', color: flow.colorOf(e.server), at: e.t,
-      title: esc(t('connect', { server: e.server })), sub: e.url });
+      title: t('connect', { server: e.server }), sub: e.url });
     await flow.sleep(450);
   },
 
@@ -121,7 +122,7 @@ const HANDLERS = {
     flow.edge(e.server, 'live');
     flow.serverDiscovered(e.server, e);
     steps.add({ phase: 'discover', badge: 'DISCOVER', color: flow.colorOf(e.server), at: e.t,
-      title: esc(t('serverReady', { server: e.server, version: e.version, n: e.tools.length })), sub: e.instructions,
+      title: t('serverReady', { server: e.server, version: e.version, n: e.tools.length }), sub: e.instructions,
       json: e.tools });
     await flow.sleep(350);
   },
@@ -129,7 +130,7 @@ const HANDLERS = {
   async tools_registered(e) {
     narrate('nRegistered');
     steps.add({ phase: 'register', badge: 'REGISTER', color: flow.colorOf(e.server), at: e.t,
-      title: esc(t('registered', { n: e.tools.length })), json: e.tools.map((fn) => ({ type: 'function', function: fn })) });
+      title: t('registered', { n: e.tools.length }), json: e.tools });
     await flow.registerTools(e.server, e.tools);
   },
 
@@ -139,16 +140,16 @@ const HANDLERS = {
     flow.setAgent('ready');
     status('ready', { n: toolCount });
     narrate('nReady', { n: toolCount });
-    steps.add({ phase: 'ready', badge: 'READY', at: e.t, title: esc(t('ready', { n: toolCount })) });
+    steps.add({ phase: 'ready', badge: 'READY', at: e.t, title: t('ready', { n: toolCount }) });
     chat.setEnabled(true);
   },
 
   async boot_error(e) {
-    flow.serverDown(e.server);
+    if (e.reason === 'unavailable') flow.serverDown(e.server);  // a name conflict is not the server's health
     flow.setAgent('off');
     status('down');
-    narrate('bootError', { server: e.server });
-    steps.add({ phase: 'error', badge: 'ERROR', at: e.t, title: esc(t('bootError', { server: e.server })), sub: e.error });
+    narrate('nError', { text: e.error });
+    steps.add({ phase: 'error', badge: 'ERROR', at: e.t, title: t('bootError', { server: e.server }), sub: e.error });
     chat.setEnabled(false);
   },
 
@@ -158,16 +159,15 @@ const HANDLERS = {
     status('busy');
     steps.section(t('secTurn'), e.text);
     narrate('nUser');
-    steps.add({ phase: 'user', badge: 'USER', at: e.t, title: esc(t('user')), sub: e.text });
-    await flow.packet('user', 'fwd', t('pktMessage'), 'var(--user)');
+    steps.add({ phase: 'user', badge: 'USER', at: e.t, title: t('user'), sub: e.text });
+    await flow.packet('user', 'fwd', t('pktMessage'));
   },
 
   async llm_request(e) {
     narrate('nLLM', { n: e.tools.length });
-    steps.add({ phase: 'llm', badge: 'LLM', color: 'var(--llm)', at: e.t,
-      title: esc(t('llmRequest', { round: e.round, n: e.tools.length })),
+    steps.add({ phase: 'llm', badge: 'LLM', at: e.t, title: t('llmRequest', { round: e.round, n: e.tools.length }),
       json: { messages: e.messages, tools: e.tools } });
-    await flow.packet('llm', 'fwd', t('pktFns', { n: e.tools.length }), 'var(--llm)');
+    await flow.packet('llm', 'fwd', t('pktFns', { n: e.tools.length }));
     flow.llmThinking(true);
   },
 
@@ -175,16 +175,15 @@ const HANDLERS = {
     flow.llmThinking(false);
     if (!e.tool_calls.length) {
       narrate('nDecisionText');
-      steps.add({ phase: 'decision', badge: 'DECIDE', color: 'var(--llm)', at: e.t, title: esc(t('decisionText')) });
-      await flow.packet('llm', 'back', t('pktText'), 'var(--llm)');
+      steps.add({ phase: 'decision', badge: 'DECIDE', at: e.t, title: t('decisionText') });
+      await flow.packet('llm', 'back', t('pktText'));
       return;
     }
-    const names = e.tool_calls.map((c) => c.name);
+    const names = e.tool_calls.map((c) => c.function.name);
     narrate('nDecisionTools', { list: list(names.map((n) => `${n}()`)) });
-    steps.add({ phase: 'decision', badge: 'DECIDE', color: 'var(--llm)', at: e.t,
-      title: t('decisionTools', { list: list(names.map(code)) }),
-      json: e.tool_calls.map((c) => ({ id: c.id, function: { name: c.name, arguments: c.arguments } })) });
-    await flow.packet('llm', 'back', t('pktTools', { list: names.join(', ') }), 'var(--llm)');
+    steps.add({ phase: 'decision', badge: 'DECIDE', at: e.t,
+      titleHtml: t('decisionTools', { list: list(names.map(code)) }), json: e.tool_calls });
+    await flow.packet('llm', 'back', t('pktTools', { list: names.join(', ') }));
     flow.choose(names);
     await flow.sleep(300);
   },
@@ -193,45 +192,34 @@ const HANDLERS = {
     flow.rowState(e.name, 'running');
     narrate('nRoute', { name: e.name, server: e.server });
     steps.add({ phase: 'route', badge: 'ROUTE', color: flow.colorOf(e.server), at: e.t,
-      title: t('route', { name: code(e.name), server: `<span class="who">${esc(e.server)}</span>` }),
-      sub: t('subCall'), json: e.arguments });
+      titleHtml: t('route', { name: code(e.name), server: who(e.server) }), sub: t('subCall'), json: e.arguments });
     await flow.sleep(350);
   },
 
   async tool_result(e) {
     if (!e.server) {
-      steps.add({ phase: 'error', badge: 'BLOCKED', at: e.t, title: t('unknownTool', { name: code(e.name) }) });
+      steps.add({ phase: 'error', badge: 'BLOCKED', at: e.t, titleHtml: t('unknownTool', { name: code(e.name) }) });
       return;
     }
     flow.rowState(e.name, e.is_error ? 'err' : 'ok');
     narrate('nResult', { server: e.server });
     steps.add({ phase: 'result', badge: 'RESULT', color: flow.colorOf(e.server), at: e.t,
-      title: t(e.is_error ? 'resultErr' : 'result', { name: code(e.name) }), json: e.result });
+      titleHtml: t(e.is_error ? 'resultErr' : 'result', { name: code(e.name) }), json: e.result });
     await flow.sleep(250);
   },
 
   async answer(e) {
-    narrate('nAnswer');
-    steps.add({ phase: 'answer', badge: 'ANSWER', at: e.t, title: esc(t('answer')), sub: e.text });
-    await flow.packet('user', 'back', t('pktAnswer'), 'var(--user)');
-    chat.addBot(e.text);
-    answered = true;
-    finishTurn();
-  },
-
-  async error(e) {
-    steps.add({ phase: 'error', badge: 'ERROR', at: e.t, title: esc(t('error')), sub: e.text });
-    narrate('error');
-    $('now').textContent = e.text;
+    if (e.error) narrate('nError', { text: e.text }); else narrate('nAnswer');
+    steps.add({ phase: e.error ? 'error' : 'answer', badge: e.error ? 'ERROR' : 'ANSWER', at: e.t,
+      title: t(e.error ? 'error' : 'answer'), sub: e.text });
+    await flow.packet('user', 'back', t('pktAnswer'), { error: e.error });
+    chat.addBot(e.text, { error: e.error });
+    flow.setAgent('ready');
+    flow.llmThinking(false);
+    status('ready', { n: toolCount });
+    chat.setBusy(false);
   },
 };
-
-function finishTurn() {
-  flow.setAgent('ready');
-  flow.llmThinking(false);
-  status('ready', { n: toolCount });
-  chat.setBusy(false);
-}
 
 // --- actions ------------------------------------------------------------------------------------------
 
@@ -239,23 +227,20 @@ async function send(text) {
   chat.addUser(text);
   chat.showTyping(true);
   chat.setBusy(true);
-  answered = false;
-  let data = null, failure = null;
   try {
     const response = await fetch('/api/chat', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, conversation }),
     });
-    data = await response.json();
-    if (!response.ok) failure = data.error || `HTTP ${response.status}`;
-    else conversation = data.conversation;
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    conversation = data.conversation;
+    // The animation shows the answer. Only if the event stream is down does the text come from here.
+    const live = source?.readyState === EventSource.OPEN;
+    await playedUpTo(data.seq);
+    if (!live) { chat.addBot(data.text); chat.setBusy(false); }
   } catch (e) {
-    failure = String(e);
-  }
-  await new Promise((r) => setTimeout(r, 300));
-  await whenIdle();  // the answer is shown by the animation; this is the fallback if the event stream dropped
-  if (!answered) {
-    chat.addBot(failure || data.text, { error: Boolean(failure) });
-    finishTurn();
+    chat.addBot(String(e.message || e), { error: true });
+    chat.setBusy(false);
   }
 }
 
@@ -267,7 +252,7 @@ async function boot() {
 
 function connectEvents() {
   return new Promise((resolve) => {
-    const source = new EventSource('/api/events');
+    source = new EventSource('/api/events');
     source.onopen = () => resolve();
     source.onmessage = (m) => enqueue(JSON.parse(m.data));
   });
@@ -277,15 +262,12 @@ function relabelAll() {
   apply();
   flow.relabel();
   chat.renderSuggestions();
-  const s = $('status');
-  if (s.dataset.kind) status(s.dataset.kind, JSON.parse(s.dataset.params || '{}'));
-  const now = $('now');
-  if (now.dataset.key) narrate(now.dataset.key, JSON.parse(now.dataset.params || '{}'));
+  status(...lastStatus);
+  narrate(...lastNarration);
   document.querySelectorAll('.lang').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.lang === getLang())));
 }
 
 async function main() {
-  setLang(getLang());
   document.querySelectorAll('[data-icon]').forEach((el) => { el.innerHTML = ICON[el.dataset.icon]; });
   $('brand-mark').innerHTML = ICON.plug;
   const state = await (await fetch('/api/state')).json();
@@ -294,8 +276,6 @@ async function main() {
   steps.init($('steps'), $('step-count'));
   chat.init({ messages: $('messages'), form: $('composer'), input: $('input'), send: $('send'),
     suggestions: $('suggestions') }, send);
-  status('off');
-  narrate('nIdle');
   relabelAll();
 
   $('btn-slow').addEventListener('click', (e) => {

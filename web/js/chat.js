@@ -1,9 +1,8 @@
 // The chat panel: messages, suggestions, composer.
 import { t } from './i18n.js';
+import { esc } from './util.js';
 
 let messages, form, input, send, suggestions, onSend, typing = null, enabled = false, busy = false;
-
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 // Minimal, safe formatting: everything is escaped first, then **bold** and "- " bullets.
 function format(text) {
@@ -26,7 +25,6 @@ export function init(els, handler) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(input.value); }
   });
   renderSuggestions();
-  update();
 }
 
 function submit(raw) {

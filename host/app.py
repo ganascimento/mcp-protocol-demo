@@ -13,8 +13,8 @@ from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from host.agent import Agent
-from host.config import MAX_TEXT, MCP_SERVERS
+from host.agent import Agent, BootError
+from host.config import MAX_TEXT
 from host.events import EventBus
 
 WEB = Path(__file__).resolve().parents[1] / "web"
@@ -25,13 +25,10 @@ MAX_HISTORY = 20  # messages kept per conversation (user + assistant text)
 def create_app(agent: Agent, bus: EventBus) -> Starlette:
     conversations: OrderedDict[str, list[dict]] = OrderedDict()
 
-    async def boot_quietly() -> None:
-        with contextlib.suppress(Exception):  # a server that is down shows up as boot_error; the UI can retry
-            await agent.boot()
-
     @contextlib.asynccontextmanager
     async def lifespan(_):
-        await boot_quietly()  # ready for the API even before a browser opens
+        with contextlib.suppress(BootError):  # shown as boot_error; the UI can retry
+            await agent.boot()  # ready for the API even before a browser opens
         yield
         await agent.close()
 
@@ -39,8 +36,7 @@ def create_app(agent: Agent, bus: EventBus) -> Starlette:
         return FileResponse(WEB / "index.html")
 
     async def state(_: Request) -> JSONResponse:
-        return JSONResponse({"ready": agent.ready, "model": getattr(agent.llm, "model", "llm"),
-                             "servers": MCP_SERVERS})
+        return JSONResponse({"ready": agent.ready, "model": agent.model, "servers": agent.servers})
 
     async def events(request: Request) -> StreamingResponse:
         queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
@@ -68,7 +64,7 @@ def create_app(agent: Agent, bus: EventBus) -> Starlette:
     async def boot(_: Request) -> JSONResponse:
         try:
             await agent.boot()
-        except Exception as e:  # noqa: BLE001
+        except BootError as e:
             return JSONResponse({"ready": False, "error": str(e)}, status_code=502)
         return JSONResponse({"ready": True, "tools": list(agent.registry)})
 
@@ -84,11 +80,11 @@ def create_app(agent: Agent, bus: EventBus) -> Starlette:
             return JSONResponse({"error": "the agent is not ready (is every MCP server up?)"}, status_code=503)
         history = conversations.pop(conversation_id, [])
         answer = await agent.reply(history, text)
-        history = (history + [{"role": "user", "content": text}, {"role": "assistant", "content": answer}])
+        history = history + [{"role": "user", "content": text}, {"role": "assistant", "content": answer.text}]
         conversations[conversation_id] = history[-MAX_HISTORY:]
         while len(conversations) > MAX_CONVERSATIONS:
             conversations.popitem(last=False)
-        return JSONResponse({"text": answer, "conversation": conversation_id})
+        return JSONResponse({"text": answer.text, "seq": answer.seq, "conversation": conversation_id})
 
     return Starlette(routes=[
         Route("/", index),

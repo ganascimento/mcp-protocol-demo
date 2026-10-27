@@ -20,7 +20,6 @@ const STR = {
     pktText: 'text answer', pktResult: 'result', pktRefused: 'isError', pktVersion: 'version {v}', pktList: '{n} tools',
     secBoot: 'Boot', secTurn: 'Message',
     bootStart: 'Agent starts: it only knows {n} URLs', connect: 'Connect to {server}',
-    subDiscover: 'agree on protocol version and capabilities', subList: '"what can you do?"',
     subCall: 'runs on the server that owns the tool',
     serverReady: '{server}: protocol {version} · {n} tools',
     registered: '{n} MCP tools → {n} functions in the registry', ready: 'Ready: the LLM will see {n} functions',
@@ -44,7 +43,7 @@ const STR = {
     nRoute: 'The host looks up {name} in the registry: it belongs to {server}, so tools/call goes there.',
     nResult: '{server} answered. The result goes back to the LLM as the function\'s return value.',
     nAnswer: 'Answer delivered.', nIdle: 'Send a message to watch the agent decide.',
-    stepsEmpty: 'Steps show up here as they happen.', payload: 'payload', and: ' and ',
+    nError: '{text}', stepsEmpty: 'Steps show up here as they happen.', payload: 'payload',
   },
   pt: {
     subtitle: '1 agente · 2 servidores MCP · ao vivo',
@@ -66,7 +65,6 @@ const STR = {
     pktText: 'resposta em texto', pktResult: 'resultado', pktRefused: 'isError', pktVersion: 'versão {v}', pktList: '{n} tools',
     secBoot: 'Inicialização', secTurn: 'Mensagem',
     bootStart: 'Agente inicia: só conhece {n} URLs', connect: 'Conectar ao {server}',
-    subDiscover: 'combinam versão do protocolo e capacidades', subList: '"o que você sabe fazer?"',
     subCall: 'roda no servidor dono da tool',
     serverReady: '{server}: protocolo {version} · {n} tools',
     registered: '{n} tools MCP → {n} funções no registro', ready: 'Pronto: o LLM vai enxergar {n} funções',
@@ -90,18 +88,19 @@ const STR = {
     nRoute: 'O host procura {name} no registro: pertence ao {server}, então o tools/call vai para lá.',
     nResult: '{server} respondeu. O resultado volta ao LLM como o retorno da função.',
     nAnswer: 'Resposta entregue.', nIdle: 'Mande uma mensagem para ver o agente decidir.',
-    stepsEmpty: 'Os passos aparecem aqui conforme acontecem.', payload: 'payload', and: ' e ',
+    nError: '{text}', stepsEmpty: 'Os passos aparecem aqui conforme acontecem.', payload: 'payload',
   },
 };
 
 const stored = () => { try { return localStorage.getItem('lang'); } catch { return null; } };
-let lang = stored() || (navigator.language || 'pt').slice(0, 2);
-if (!STR[lang]) lang = 'en';
+const pick = (l) => (STR[l] ? l : 'en');
+let lang = pick(stored() || (navigator.language || 'pt').slice(0, 2));
+document.documentElement.lang = lang === 'pt' ? 'pt-BR' : 'en';
 
 export const getLang = () => lang;
 
 export function setLang(next) {
-  lang = STR[next] ? next : 'en';
+  lang = pick(next);
   try { localStorage.setItem('lang', lang); } catch { /* private mode */ }
   document.documentElement.lang = lang === 'pt' ? 'pt-BR' : 'en';
 }
@@ -112,10 +111,7 @@ export function t(key, params = {}) {
   return value.replace(/\{(\w+)\}/g, (_, k) => params[k] ?? '');
 }
 
-export function list(items) {
-  if (items.length < 2) return items.join('');
-  return items.slice(0, -1).join(', ') + t('and') + items[items.length - 1];
-}
+export const list = (items) => new Intl.ListFormat(lang, { type: 'conjunction' }).format(items);
 
 export function apply(root = document) {
   root.querySelectorAll('[data-i18n]').forEach((el) => { el.textContent = t(el.dataset.i18n); });

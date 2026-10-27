@@ -59,9 +59,9 @@ def get_care_guide(plant_id: str) -> dict:
 @mcp.tool(annotations=types.ToolAnnotations(read_only_hint=False, idempotent_hint=False))
 def log_watering(plant_id: str) -> dict:
     """Records that the user watered a plant today. Only when the user SAYS they watered it — never on your own."""
-    plant = _plant(plant_id)
-    if plant["last_watered"] == data.today():
+    plant, today = _plant(plant_id), data.today()
+    if plant["last_watered"] == today:
         raise ToolError(f"{plant['name']} was already logged as watered today.")
-    plant["last_watered"] = data.today()
-    next_date = data.today() + timedelta(days=plant["water_every_days"])
-    return {"plant": plant["name"], "last_watered": data.today().isoformat(), "next_watering": next_date.isoformat()}
+    plant["last_watered"] = today
+    next_date = today + timedelta(days=plant["water_every_days"])
+    return {"plant": plant["name"], "last_watered": today.isoformat(), "next_watering": next_date.isoformat()}

@@ -12,11 +12,12 @@ class EventBus:
         self._listeners: set[Listener] = set()
         self._seq = 0
 
-    def emit(self, kind: str, **data) -> None:
+    def emit(self, kind: str, **data) -> dict:
         self._seq += 1
         event = {"seq": self._seq, "t": time.time(), "kind": kind, **data}
         for listener in list(self._listeners):
             listener(event)
+        return event
 
     def listen(self, listener: Listener) -> Callable[[], None]:
         self._listeners.add(listener)

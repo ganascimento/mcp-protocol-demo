@@ -39,10 +39,17 @@ def _root(e: BaseException) -> BaseException:
 
 
 def _json(raw: bytes) -> object:
+    if not raw:
+        return None
     try:
         return json.loads(raw)
     except ValueError:
         return raw.decode(errors="replace")
+
+
+def _route(request: httpx2.Request) -> dict:
+    """The mirrored routing headers: what a gateway reads without parsing the body."""
+    return {"method": request.headers.get("mcp-method"), "name": request.headers.get("mcp-name")}
 
 
 class MCPConnection:
@@ -51,21 +58,23 @@ class MCPConnection:
         self.protocol_version: str | None = None
         self.server_info: types.Implementation | None = None
         self.instructions: str | None = None
-        self.tools: list[types.Tool] = []
-        self._sent: dict[int, float] = {}
         self._client: Client | None = None
         self._task: asyncio.Task | None = None
+        self._opened: asyncio.Future | None = None
+        self._stop = asyncio.Event()
+
+    def _unavailable(self, e: BaseException) -> ServerUnavailable:
+        return ServerUnavailable(f"MCP server '{self.name}' is unavailable ({_root(e)!r})")
 
     async def open(self) -> list[types.Tool]:
         """Connects and discovers. The Client lives in a task of its own (anyio: a client must be closed by the
         task that opened it — and the web app boots in one request and shuts down in another)."""
-        loop = asyncio.get_running_loop()
-        self._opened, self._stop = loop.create_future(), asyncio.Event()
+        self._opened = asyncio.get_running_loop().create_future()
         self._task = asyncio.create_task(self._own_client())
         try:
             return await self._opened
         except Exception as e:  # noqa: BLE001
-            raise ServerUnavailable(f"MCP server '{self.name}' is unavailable ({_root(e)!r})") from e
+            raise self._unavailable(e) from e
 
     async def _own_client(self) -> None:
         hooks = {"request": [self._on_request], "response": [self._on_response]}
@@ -83,16 +92,16 @@ class MCPConnection:
                     tools += page.tools
                     if not (cursor := page.next_cursor):
                         break
-                self._client, self.tools = client, tools
+                self._client = client
                 self._opened.set_result(tools)
                 await self._stop.wait()
-        except BaseException as e:
+        except Exception as e:  # noqa: BLE001
             if not self._opened.done():
-                self._opened.set_exception(e if isinstance(e, Exception) else RuntimeError(repr(e)))
-            if not isinstance(e, Exception):
-                raise
+                self._opened.set_exception(e)
         finally:
             self._client = None
+            if not self._opened.done():  # cancelled before discovery finished
+                self._opened.cancel()
 
     async def call_tool(self, name: str, arguments: dict) -> types.CallToolResult:
         if self._client is None:
@@ -100,7 +109,7 @@ class MCPConnection:
         try:
             return await self._client.call_tool(name, arguments)  # one POST: the version is already negotiated
         except Exception as e:  # noqa: BLE001 — a business refusal comes back as a RESULT (isError), never raises
-            raise ServerUnavailable(f"MCP server '{self.name}' is unavailable ({_root(e)!r})") from e
+            raise self._unavailable(e) from e
 
     async def close(self) -> None:
         if self._task:
@@ -111,16 +120,14 @@ class MCPConnection:
     # --- wire observation (UI only) ------------------------------------------------------------------
 
     async def _on_request(self, request: httpx2.Request) -> None:
-        self._sent[id(request)] = time.perf_counter()
+        request.extensions["sent_at"] = time.perf_counter()
         headers = {k: v for k, v in request.headers.items() if k.lower().startswith("mcp")}
         self.bus.emit("wire", server=self.name, dir="out", http=f"{request.method} {request.url.path}",
-                      method=request.headers.get("mcp-method"), name=request.headers.get("mcp-name"),
-                      headers=headers, body=_json(request.content) if request.content else None)
+                      headers=headers, body=_json(request.content), **_route(request))
 
     async def _on_response(self, response: httpx2.Response) -> None:
         await response.aread()
-        started = self._sent.pop(id(response.request), time.perf_counter())
+        sent_at = response.request.extensions.get("sent_at", time.perf_counter())
         self.bus.emit("wire", server=self.name, dir="in", status=response.status_code,
-                      method=response.request.headers.get("mcp-method"), name=response.request.headers.get("mcp-name"),
-                      ms=round((time.perf_counter() - started) * 1000, 1),
-                      body=_json(response.content) if response.content else None)
+                      ms=round((time.perf_counter() - sent_at) * 1000, 1), body=_json(response.content),
+                      **_route(response.request))

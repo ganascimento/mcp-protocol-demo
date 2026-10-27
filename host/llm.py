@@ -14,6 +14,6 @@ class OpenAIChat:
 
     async def __call__(self, messages: list[dict], tools: list[dict]) -> dict:
         response = await self._client.chat.completions.create(
-            model=MODEL, messages=messages, tools=tools, reasoning_effort=REASONING_EFFORT,
+            model=self.model, messages=messages, tools=tools, reasoning_effort=REASONING_EFFORT,
         )
         return response.choices[0].message.model_dump(exclude_none=True)
